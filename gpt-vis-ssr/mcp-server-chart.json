@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "charts": {
+      "command": "npx",
+      "args": ["-y", "@antv/mcp-server-chart"],
+      "env": {
+        "VIS_REQUEST_SERVER": "http://your-server:7001/api/render"
+      }
+    }
+  }
+}
