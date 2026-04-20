@@ -1,0 +1,176 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/transport"
+	"github.com/r3labs/sse/v2"
+)
+
+// ==========================================
+// 自定义 SSE Transport 实现
+// 符合 MCP 规范：POST /message 发送，GET /sse 接收
+// ==========================================
+type SSETransport struct {
+	httpClient *http.Client
+	sseClient  *sse.Client
+	sseChan    chan []byte
+	baseURL    string
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func NewSSETransport(baseURL string) (*SSETransport, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	t := &SSETransport{
+		httpClient: &http.Client{},
+		sseChan:    make(chan []byte, 100),
+		baseURL:    baseURL,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	// 初始化 SSE 客户端
+	t.sseClient = sse.NewClient(baseURL + "/sse")
+	
+	// 启动 SSE 订阅
+	go func() {
+		err := t.sseClient.SubscribeChanRaw(t.ctx, t.sseChan)
+		if err != nil {
+			log.Printf("SSE 订阅错误: %v", err)
+		}
+	}()
+
+	return t, nil
+}
+
+// Send 发送消息到 MCP Server（POST /message）
+func (t *SSETransport) Send(ctx context.Context, message []byte) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", t.baseURL+"/message", bytes.NewReader(message))
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("意外的状态码: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// Receive 从 MCP Server 接收消息（SSE 事件）
+func (t *SSETransport) Receive(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-t.ctx.Done():
+		return nil, t.ctx.Err()
+	case event := <-t.sseChan:
+		// SSE 事件数据就是 MCP 消息
+		return event, nil
+	}
+}
+
+// Close 关闭传输
+func (t *SSETransport) Close() error {
+	t.cancel()
+	t.sseClient.Close()
+	close(t.sseChan)
+	return nil
+}
+
+// ==========================================
+// 主程序：使用 SSE Transport 测试 MCP Server
+// ==========================================
+func main() {
+	// 1. 配置：替换为你的 MCP Server HTTP 地址
+	serverURL := "http://localhost:8080"
+
+	ctx := context.Background()
+
+	// 2. 创建自定义 SSE Transport
+	fmt.Printf("🔌 连接 MCP Server (SSE): %s\n", serverURL)
+	sseTransport, err := NewSSETransport(serverURL)
+	if err != nil {
+		log.Fatalf("❌ 创建 SSE Transport 失败: %v", err)
+	}
+	defer sseTransport.Close()
+
+	// 3. 创建 MCP Client
+	mcpClient, err := client.NewClient(sseTransport)
+	if err != nil {
+		log.Fatalf("❌ 创建 MCP Client 失败: %v", err)
+	}
+	defer mcpClient.Close()
+
+	// 4. 初始化 Client
+	fmt.Println("🚀 初始化 MCP Client...")
+	initResult, err := mcpClient.Initialize(ctx, mcp.InitializeRequest{
+		ProtocolVersion: mcp.LatestProtocolVersion,
+		Capabilities: mcp.ClientCapabilities{
+			Tools: &mcp.ClientToolsCapability{},
+		},
+		ClientInfo: mcp.Implementation{
+			Name:    "sse-mcp-test-client",
+			Version: "1.0.0",
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ 初始化失败: %v", err)
+	}
+
+	fmt.Printf("✅ 连接成功！\n")
+	fmt.Printf("   Server: %s v%s\n", initResult.ServerInfo.Name, initResult.ServerInfo.Version)
+	fmt.Println("---")
+
+	// 5. 列出工具
+	fmt.Println("📋 列出可用工具...")
+	listToolsResult, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		log.Fatalf("❌ 列出工具失败: %v", err)
+	}
+
+	for _, tool := range listToolsResult.Tools {
+		fmt.Printf("  - %s: %s\n", tool.Name, tool.Description)
+	}
+	fmt.Println("---")
+
+	// 6. 测试调用工具（示例）
+	fmt.Println("🔧 测试调用工具: db_platform_list_platforms")
+	callResult, err := mcpClient.CallTool(ctx, mcp.CallToolRequest{
+		Name: "db_platform_list_platforms",
+		Arguments: map[string]interface{}{
+			"keyword": "",
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ 调用工具失败: %v", err)
+	}
+
+	if callResult.IsError {
+		fmt.Printf("⚠️  工具返回错误: %v\n", callResult.Content)
+	} else {
+		fmt.Println("✅ 工具调用成功！")
+		for _, content := range callResult.Content {
+			if text, ok := content.(mcp.TextContent); ok {
+				fmt.Printf("   结果:\n%s\n", text.Text)
+			}
+		}
+	}
+
+	fmt.Println("🎉 测试完成！")
+}

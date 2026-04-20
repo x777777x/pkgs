@@ -1,0 +1,225 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/transport"
+)
+
+// ==========================================
+// 自定义 Stream HTTP Transport 实现
+// 基于 HTTP/1.1 Chunked Encoding 的双向流式传输
+// ==========================================
+type StreamHTTPTransport struct {
+	httpClient *http.Client
+	baseURL    string
+	reader     *bufio.Reader
+	writer     io.Writer
+	conn       io.ReadWriteCloser
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func NewStreamHTTPTransport(baseURL string) (*StreamHTTPTransport, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	t := &StreamHTTPTransport{
+		httpClient: &http.Client{},
+		baseURL:    baseURL,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	// 建立流式 HTTP 连接
+	if err := t.connect(); err != nil {
+		cancel()
+		return nil, err
+	}
+
+	return t, nil
+}
+
+// connect 建立流式 HTTP 连接
+func (t *StreamHTTPTransport) connect() error {
+	// 创建一个管道，用于模拟流式请求体
+	pr, pw := io.Pipe()
+	t.writer = pw
+
+	// 创建流式请求
+	req, err := http.NewRequestWithContext(t.ctx, "POST", t.baseURL+"/stream", pr)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Transfer-Encoding", "chunked")
+
+	// 发送请求并获取响应
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("连接失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("意外的状态码: %d", resp.StatusCode)
+	}
+
+	// 保存连接
+	t.reader = bufio.NewReader(resp.Body)
+	t.conn = &streamConn{
+		reader: resp.Body,
+		writer: pw,
+		closer: func() error {
+			resp.Body.Close()
+			pw.Close()
+			return nil
+		},
+	}
+
+	return nil
+}
+
+// streamConn 简单的 ReadWriteCloser 包装
+type streamConn struct {
+	reader io.ReadCloser
+	writer io.Writer
+	closer func() error
+}
+
+func (c *streamConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *streamConn) Write(p []byte) (int, error) {
+	return c.writer.Write(p)
+}
+
+func (c *streamConn) Close() error {
+	return c.closer()
+}
+
+// Send 发送消息
+func (t *StreamHTTPTransport) Send(ctx context.Context, message []byte) error {
+	// 添加换行符作为消息分隔符
+	message = append(message, '\n')
+	
+	_, err := t.writer.Write(message)
+	if err != nil {
+		// 尝试重连
+		if err := t.connect(); err != nil {
+			return fmt.Errorf("重连失败: %w", err)
+		}
+		_, err = t.writer.Write(message)
+	}
+	return err
+}
+
+// Receive 接收消息
+func (t *StreamHTTPTransport) Receive(ctx context.Context) ([]byte, error) {
+	// 按行读取消息（换行符分隔）
+	line, err := t.reader.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	// 去掉末尾的换行符
+	return bytes.TrimSpace(line), nil
+}
+
+// Close 关闭传输
+func (t *StreamHTTPTransport) Close() error {
+	t.cancel()
+	if t.conn != nil {
+		return t.conn.Close()
+	}
+	return nil
+}
+
+// ==========================================
+// 主程序：使用 Stream HTTP Transport 测试 MCP Server
+// ==========================================
+func main() {
+	// 1. 配置：替换为你的 MCP Server Stream HTTP 地址
+	serverURL := "http://localhost:8080"
+
+	ctx := context.Background()
+
+	// 2. 创建自定义 Stream HTTP Transport
+	fmt.Printf("🔌 连接 MCP Server (Stream HTTP): %s\n", serverURL)
+	streamTransport, err := NewStreamHTTPTransport(serverURL)
+	if err != nil {
+		log.Fatalf("❌ 创建 Stream HTTP Transport 失败: %v", err)
+	}
+	defer streamTransport.Close()
+
+	// 3. 创建 MCP Client
+	mcpClient, err := client.NewClient(streamTransport)
+	if err != nil {
+		log.Fatalf("❌ 创建 MCP Client 失败: %v", err)
+	}
+	defer mcpClient.Close()
+
+	// 4. 初始化 Client
+	fmt.Println("🚀 初始化 MCP Client...")
+	initResult, err := mcpClient.Initialize(ctx, mcp.InitializeRequest{
+		ProtocolVersion: mcp.LatestProtocolVersion,
+		Capabilities: mcp.ClientCapabilities{
+			Tools: &mcp.ClientToolsCapability{},
+		},
+		ClientInfo: mcp.Implementation{
+			Name:    "stream-http-mcp-test-client",
+			Version: "1.0.0",
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ 初始化失败: %v", err)
+	}
+
+	fmt.Printf("✅ 连接成功！\n")
+	fmt.Printf("   Server: %s v%s\n", initResult.ServerInfo.Name, initResult.ServerInfo.Version)
+	fmt.Println("---")
+
+	// 5. 列出工具
+	fmt.Println("📋 列出可用工具...")
+	listToolsResult, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		log.Fatalf("❌ 列出工具失败: %v", err)
+	}
+
+	for _, tool := range listToolsResult.Tools {
+		fmt.Printf("  - %s: %s\n", tool.Name, tool.Description)
+	}
+	fmt.Println("---")
+
+	// 6. 测试调用工具（示例）
+	fmt.Println("🔧 测试调用工具: db_platform_query_clusters")
+	callResult, err := mcpClient.CallTool(ctx, mcp.CallToolRequest{
+		Name: "db_platform_query_clusters",
+		Arguments: map[string]interface{}{
+			"platform_id": "platform-001",
+			"db_type":     "MySQL",
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ 调用工具失败: %v", err)
+	}
+
+	if callResult.IsError {
+		fmt.Printf("⚠️  工具返回错误: %v\n", callResult.Content)
+	} else {
+		fmt.Println("✅ 工具调用成功！")
+		for _, content := range callResult.Content {
+			if text, ok := content.(mcp.TextContent); ok {
+				fmt.Printf("   结果:\n%s\n", text.Text)
+			}
+		}
+	}
+
+	fmt.Println("🎉 测试完成！")
+}
